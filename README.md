@@ -1,6 +1,6 @@
 # Webhook Inbox
 
-基于 FastAPI + SQLite 的 webhook 收件箱服务。接收事件、**来源签名校验与重放防护**、幂等去重、按时间游标分页查询、单条确认，数据持久化到 SQLite。
+基于 FastAPI + SQLite 的 webhook 收件箱服务。接收事件、**来源签名校验与重放防护**、幂等去重、**事件依赖门禁**、按时间游标分页查询、就绪队列与单条确认，数据持久化到 SQLite。
 
 ## 功能
 
@@ -10,18 +10,22 @@
   - 时间戳偏离服务器时间超过 **300 秒**、来源未知、签名错误、nonce 为空/超长，一律 **401 且零写入**
   - **同来源 nonce 只能使用一次**：重放返回 401。nonce 登记与事件入库在**同一个 SQLite 写事务**内，并发重放只有一次成功
   - 支持密钥轮换：`current` 为现用密钥，`previous` + `previous_valid_until` 定义旧密钥的宽限期，过期后旧签名立即失效
-- **POST /events** 提交事件（`event_id` / `type` / `payload`）
+- **POST /events** 提交事件（`event_id` / `type` / `payload`，可选 `depends_on`）
   - 并发重复请求只保留**首个版本**，所有重复请求返回与首次一致的结果
-  - 相同 `event_id` 但内容（`type` 或 `payload`）不同 → **409 Conflict**
-  - 内容比对是语义级的：JSON 键序不同但内容相同视为同一事件
+  - 相同 `event_id` 但内容（`type`、`payload` 或**依赖集合**）不同 → **409 Conflict**
+  - 内容比对是语义级的：JSON 键序不同但内容相同视为同一事件；`depends_on` 是**集合语义**（去重、不计顺序）
+- **事件依赖门禁**（单条与批量均支持 `depends_on`，至多 **20 个唯一** event_id）
+  - 引用的事件必须**已在库中或属于同一批次**（批量允许引用同批任意位置，包括排在后面的条目）；引用缺失、自依赖、批内依赖环一律 **422**，批量场景返回出错条目下标与**环路径**，且**整批零写入**
+  - 全部校验与写入在原有写事务内完成，失败时 nonce 同样不登记
 - **POST /events/batch** 原子批量提交（1~100 个事件，结构同单条接口）
   - 批内同 `event_id` 内容语义相同 → 视为重复，映射到同一结果；内容不同 → **422** 并标出冲突下标
   - 与库中记录内容冲突 → **409** 并标出对应下标，**整批零写入**
-  - 无冲突时**单一事务**写入全部新事件，按原输入顺序返回记录与每项 `created` 标记
+  - 无冲突时**单一事务**写入全部新事件与依赖边，按原输入顺序返回记录与每项 `created` 标记
 - **GET /events** 按时间游标分页查询（键集分页，支持 `status` 过滤）
-- **POST /events/{event_id}/ack** 单条确认（幂等，重复确认返回当前状态）
+- **GET /events/ready** 沿用相同游标规则，只列出**全部依赖均已 ack 的 pending 事件**；前置事件确认后后继**立即解锁**
+- **POST /events/{event_id}/ack** 单条确认（幂等，重复确认返回当前状态）；尚有未完成依赖时返回 **409** 与 `blockers` 列表
 - **GET /events/{event_id}** 查询单条事件
-- 事件与处理状态（`pending` / `acked`）持久化到 SQLite，**启动时自动建表**；含 `used_nonces` 防重放表，升级已有数据库时只增量补表、不动旧数据
+- 事件、处理状态（`pending` / `acked`）与依赖边持久化到 SQLite，**启动时自动建表**；含 `used_nonces` 防重放表与 `event_dependencies` 依赖表，升级已有数据库时只增量补表、不动旧数据
 
 ## 快速开始（Docker，一键启动）
 
@@ -160,24 +164,38 @@ curl -i -X POST http://localhost:8000/events \
 | 情况 | 状态码 |
 | --- | --- |
 | 缺少任一头 / 来源未知 / 签名不匹配 / 时间戳超窗 / nonce 超长 / **同来源 nonce 已使用（重放）** | 401，零写入 |
-| 签名合法但请求体不是合法 JSON 或不满足字段约束 | 422 |
+| 签名合法但请求体不是合法 JSON 或不满足字段约束（含 `depends_on` 超过 20 个唯一 ID、元素超长） | 422 |
 | 单条 `event_id` 内容冲突 | 409 |
 | 批内内容冲突 422；与库中内容冲突 409（均整批零写入，nonce 不登记，可用新 nonce 重试） | 422 / 409 |
+| 依赖校验失败：引用不存在、自依赖、批内依赖环（单条与批量均整批零写入） | 422 |
+| 确认事件时仍有未完成（pending）的前置依赖 | 409，返回 `blockers` |
 
 ## API 一览
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/events` | 提交事件（**需签名头**）。首次 `201`，重复（内容相同）`200`，内容冲突 `409`，鉴权失败 `401` |
-| POST | `/events/batch` | 原子批量提交（1~100 个，**需签名头**）。有新事件 `201`，全部重复 `200`；批内冲突 `422`、与库冲突 `409`、重放/鉴权失败 `401`，均整批零写入 |
+| POST | `/events` | 提交事件（**需签名头**）。首次 `201`，重复（内容相同）`200`，内容冲突 `409`，鉴权失败 `401`，依赖校验失败 `422` |
+| POST | `/events/batch` | 原子批量提交（1~100 个，**需签名头**）。有新事件 `201`，全部重复 `200`；批内冲突 `422`、与库冲突 `409`、依赖错误（缺失/自依赖/环）`422`、重放/鉴权失败 `401`，均整批零写入 |
 | GET | `/events?limit=&cursor=&status=` | 时间游标分页查询，`limit` 默认 50、最大 200 |
+| GET | `/events/ready?limit=&cursor=` | 只列全部依赖均已 ack 的 pending 事件，游标规则同 `/events` |
 | GET | `/events/{event_id}` | 查询单条事件，不存在 `404` |
-| POST | `/events/{event_id}/ack` | 确认事件（幂等），不存在 `404` |
+| POST | `/events/{event_id}/ack` | 确认事件（幂等），不存在 `404`，尚有未完成依赖 `409`（含 `blockers`） |
 | GET | `/healthz` | 健康检查 |
 
 ### 提交事件
 
-首次返回 `201`；再次提交相同内容（**重新签名、换新 nonce**）返回 `200`，响应体与首次完全一致（均为首个版本的数据）：
+首次返回 `201`；再次提交相同内容（**重新签名、换新 nonce**）返回 `200`，响应体与首次完全一致（均为首个版本的数据）。可选的 `depends_on` 声明本事件依赖的其他事件（至多 20 个唯一 ID，顺序与重复项不影响语义）：
+
+```json
+{
+  "event_id": "evt-003",
+  "type": "invoice.issued",
+  "payload": {"order_id": "o-1"},
+  "depends_on": ["evt-001", "evt-002"]
+}
+```
+
+响应（无依赖事件同样带 `depends_on: []` 字段）：
 
 ```json
 {
@@ -186,27 +204,69 @@ curl -i -X POST http://localhost:8000/events \
   "payload": {"amount": 100},
   "status": "pending",
   "created_at": "2026-09-20T12:00:00.000000Z",
-  "acked_at": null
+  "acked_at": null,
+  "depends_on": []
 }
 ```
 
-相同 `event_id` 不同内容返回 `409`：
+相同 `event_id` 不同内容（含不同依赖集合）返回 `409`：
 
 ```json
 {"detail": "event_id 'evt-001' already exists with different content"}
+```
+
+单条入箱时引用了尚不存在的事件，或声明了自依赖，返回 `422`：
+
+```json
+{
+  "detail": {
+    "message": "dependency validation failed",
+    "errors": [
+      {"reason": "missing_dependency", "event_id": "evt-003", "missing": ["evt-002"]},
+      {"reason": "self_dependency", "event_id": "evt-003"}
+    ]
+  }
+}
 ```
 
 ### 批量提交事件
 
 一次提交 1~100 个事件（结构与单条接口相同，整批共用一组签名头，签名覆盖整批 JSON），整批原子写入：要么全部落库，要么零写入。响应按**原输入顺序**返回，每项附带 `created` 标记；批内相同 `event_id` 且内容语义相同（键序无关）视为重复，映射到同一结果。任一事件为新事件时返回 `201`，全部已存在时返回 `200`。
 
+**依赖可以引用同批任意位置的条目**（前向引用合法）。例如下例中 `evt-103` 引用排在其后的 `evt-102`，整批仍可成功：
+
+```json
+{
+  "events": [
+    {"event_id": "evt-103", "type": "invoice.issued", "payload": {}, "depends_on": ["evt-102"]},
+    {"event_id": "evt-102", "type": "order.paid", "payload": {}, "depends_on": ["evt-101"]},
+    {"event_id": "evt-101", "type": "order.created", "payload": {}}
+  ]
+}
+```
+
 ```json
 {
   "items": [
-    {"event_id": "evt-101", "type": "order.paid", "payload": {"amount": 100}, "status": "pending", "created_at": "2026-09-21T03:00:00.000000Z", "acked_at": null, "created": true},
-    {"event_id": "evt-102", "type": "order.paid", "payload": {"amount": 200}, "status": "pending", "created_at": "2026-09-21T03:00:00.000100Z", "acked_at": null, "created": true},
-    {"event_id": "evt-101", "type": "order.paid", "payload": {"amount": 100}, "status": "pending", "created_at": "2026-09-21T03:00:00.000000Z", "acked_at": null, "created": true}
+    {"event_id": "evt-103", "type": "invoice.issued", "payload": {}, "status": "pending", "created_at": "2026-09-21T03:00:00.000200Z", "acked_at": null, "depends_on": ["evt-102"], "created": true},
+    {"event_id": "evt-102", "type": "order.paid", "payload": {}, "status": "pending", "created_at": "2026-09-21T03:00:00.000100Z", "acked_at": null, "depends_on": ["evt-101"], "created": true},
+    {"event_id": "evt-101", "type": "order.created", "payload": {}, "status": "pending", "created_at": "2026-09-21T03:00:00.000000Z", "acked_at": null, "depends_on": [], "created": true}
   ]
+}
+```
+
+依赖校验失败同样整批零写入，`indices` 标出出错条目在**原始请求数组**中的下标（批内重复出现时全部展开），`cycle` 给出首尾相接的环路径：
+
+```json
+{
+  "detail": {
+    "message": "dependency validation failed",
+    "errors": [
+      {"reason": "missing_dependency", "event_id": "evt-102", "missing": ["evt-ghost"], "indices": [1]},
+      {"reason": "self_dependency", "event_id": "evt-103", "indices": [2]},
+      {"reason": "dependency_cycle", "event_id": "evt-102", "cycle": ["evt-101", "evt-102", "evt-101"], "indices": [1, 4]}
+    ]
+  }
 }
 ```
 
@@ -241,6 +301,8 @@ curl "http://localhost:8000/events?limit=2"
 curl "http://localhost:8000/events?limit=2&cursor=<next_cursor>"
 # 只看未确认的事件
 curl "http://localhost:8000/events?status=pending"
+# 就绪队列：全部依赖均已 ack 的 pending 事件（游标规则相同）
+curl "http://localhost:8000/events/ready"
 ```
 
 响应：
@@ -255,13 +317,29 @@ curl "http://localhost:8000/events?status=pending"
 
 事件按 `(created_at, event_id)` 升序排列；`next_cursor` 为不透明游标（base64 编码的时间 + ID），`has_more=false` 时 `next_cursor` 为 `null`。非法游标返回 `400`。
 
-### 确认事件
+### 就绪队列与确认
+
+`GET /events/ready` 只返回 `pending` 且**所有 `depends_on` 均已 ack** 的事件（无依赖的 pending 事件始终就绪），可作为消费端的拉取队列；参数、分页与排序规则与 `/events` 完全一致。
 
 ```bash
 curl -X POST http://localhost:8000/events/evt-001/ack
 ```
 
-返回 `200`，`status` 变为 `acked` 并写入 `acked_at`；重复确认仍返回 `200`（幂等）。
+返回 `200`，`status` 变为 `acked` 并写入 `acked_at`；重复确认仍返回 `200`（幂等）。前置事件确认提交后，后继事件在**下一次 `/events/ready` 查询时立即出现**，无需任何额外操作。
+
+若仍有未完成的前置依赖，确认返回 `409` 且事件状态不变：
+
+```json
+{
+  "detail": {
+    "message": "event has pending dependencies",
+    "event_id": "evt-003",
+    "blockers": ["evt-002"]
+  }
+}
+```
+
+把 `blockers` 中的事件逐一确认后即可确认本事件（已 ack 的依赖不再出现在 `blockers` 中）。
 
 ## 幂等、防重放与并发设计
 
@@ -269,8 +347,11 @@ curl -X POST http://localhost:8000/events/evt-001/ack
 - **nonce 登记与入库同事务**：`used_nonces (source, nonce)` 复合主键 + 事件插入在单个 `BEGIN IMMEDIATE` 事务中完成，连接级锁与 SQLite 的写串行化共同保证并发重放（包括多连接）中**只有首个请求提交成功**，其余请求事务回滚并返回 401。内容冲突（409/409 批量冲突、422 批内冲突）同样回滚，nonce 不被登记，调用方修正后可用同一 nonce 重试。
 - **时间窗 + nonce 双保险**：时间戳窗口把可重放区间限制在 300 秒内；nonce 行至少保留 660 秒（2 倍窗口加余量），惰性清理，保证任何可能被接受的旧时间戳都无法重放。
 - 事件写入路径在同事务内「查重 + 插入 + 回读」；SQLite（WAL 模式）串行化并发写，因此并发重复 `event_id` 只有一个真正落库，其余请求读到首个版本并原样返回。
-- 内容指纹 = `SHA-256(type + 规范化JSON(payload))`（键排序、去空白），指纹不同即 `409`，已存数据不会被覆盖。批量接口在批内归并与库级比对中复用同一套指纹规则。
-- 批量写入在**单一事务**内完成「nonce 登记 + 查库比对 + 全部插入 + 回读」（连接级锁 + `BEGIN IMMEDIATE`），并发批次彼此串行：任一冲突即整批回滚，不产生部分提交，也不会覆盖首个版本。
+- 内容指纹 = `SHA-256(type + 规范化JSON(payload))`（键排序、去空白），指纹不同即 `409`，已存数据不会被覆盖。批量接口在批内归并与库级比对中复用同一套指纹规则。**依赖集合（排序去重后）追加进指纹参与幂等比对**：依赖声明的顺序与重复项不影响语义，而依赖集合不同会按内容冲突处理；无依赖时指纹与升级前算法完全一致，旧库指纹无需回填。
+- **依赖门禁内置于写事务**：单条入箱在插入前查库确认引用存在；批量入箱在同一 `BEGIN IMMEDIATE` 事务内完成「引用存在性（库中 ∪ 同批任意位置）+ 自依赖 + 批内环」检测。环检测只在批内新节点构成的子图上进行（库图在不变更既有边的前提下保证无环），报告的环路径首尾相接。任一错误整批回滚、nonce 不登记。
+- 依赖边存于独立的 `event_dependencies(event_id, depends_on)` 表（复合主键去重、集合语义），不修改既有 `events` 行；旧库启动时以 `CREATE TABLE IF NOT EXISTS` 增量建表并保留全部旧数据，旧事件视为无依赖、天然就绪。
+- **就绪判定与确认门禁**：`/events/ready` 与确认接口都以「不存在指向 pending 事件的依赖边」为准（单条 NOT EXISTS / JOIN 查询）。ack 只会把 pending 翻转为 acked，就绪集合随确认单调扩大，因此前置确认提交后后继立即解锁。确认路径同样运行在 `BEGIN IMMEDIATE` 事务内：门禁检查与状态翻转原子完成，多连接并发确认同一事件恰好翻转一次，其余请求幂等成功，不会出现“读到依赖已消失但状态未更新”的中间态。
+- 批量写入在**单一事务**内完成「nonce 登记 + 查库比对 + 依赖校验 + 全部事件/依赖边插入 + 回读」（连接级锁 + `BEGIN IMMEDIATE`），并发批次彼此串行：任一冲突即整批回滚，不产生部分提交，也不会覆盖首个版本。
 - 验签使用 `hmac.compare_digest` 常量时间比较；所有鉴权失败返回相同的 401 响应，不泄露失败环节。
 
 ## 配置
@@ -296,7 +377,7 @@ environment:
 ```bash
 pip install -r requirements-dev.txt
 export WEBHOOK_SECRETS_JSON='{"demo":{"current":"dev-only-secret-change-me"}}'
-pytest tests/ -q                 # 55 个测试：签名/重放/密钥轮换、幂等、409、分页、ack、批量原子性、并发、旧库迁移、持久化
+pytest tests/ -q                 # 85 个测试：签名/重放/密钥轮换、幂等、409、分页、依赖门禁（缺失/自依赖/环）、就绪解锁、ack 并发、批量原子性、旧库迁移、持久化
 DATABASE_PATH=./events.db uvicorn app.main:app --reload --port 8000
 ```
 
@@ -306,8 +387,8 @@ DATABASE_PATH=./events.db uvicorn app.main:app --reload --port 8000
 app/
   main.py    # FastAPI 路由、签名头依赖与请求模型（验签后手动解析原始体）
   auth.py    # WEBHOOK_SECRETS_JSON 解析、HMAC-SHA256 验签、时间窗与轮换宽限
-  store.py   # nonce 登记 + 幂等写入（同一写事务）、游标分页、确认（存储层）
-  db.py      # SQLite 连接、WAL、自动建表（events / used_nonces）
+  store.py   # nonce 登记 + 幂等写入与依赖校验（同一写事务）、依赖环检测、游标分页、就绪队列、门禁确认（存储层）
+  db.py      # SQLite 连接、WAL、自动建表（events / used_nonces / event_dependencies）
 tests/
   test_api.py
 Dockerfile

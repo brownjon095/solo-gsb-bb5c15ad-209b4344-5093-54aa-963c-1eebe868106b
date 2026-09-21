@@ -5,11 +5,11 @@ import json
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from .auth import (
     NONCE_MAX_LENGTH,
@@ -18,13 +18,17 @@ from .auth import (
 )
 from .db import Database
 from .store import (
+    MAX_DEPENDENCIES,
     BatchConflictError,
+    DependencyError,
+    EventBlockedError,
     EventConflictError,
     EventNotFoundError,
     EventStore,
     InvalidCursorError,
     ReplayError,
     content_hash,
+    normalize_dependencies,
 )
 
 
@@ -32,6 +36,19 @@ class EventIn(BaseModel):
     event_id: str = Field(min_length=1, max_length=128)
     type: str = Field(min_length=1, max_length=128)
     payload: Any
+    # 可选依赖门禁：至多 20 个唯一 event_id；集合语义，重复声明自动去重、
+    # 顺序无关。引用合法性（已在库中或同批）、自依赖与批内环在写事务内校验。
+    depends_on: list[Annotated[str, Field(min_length=1, max_length=128)]] = Field(
+        default_factory=list
+    )
+
+    @field_validator("depends_on")
+    @classmethod
+    def _validate_depends_on(cls, value: list[str]) -> list[str]:
+        normalized = normalize_dependencies(value)
+        if len(normalized) > MAX_DEPENDENCIES:
+            raise ValueError(f"depends_on accepts at most {MAX_DEPENDENCIES} unique event_ids")
+        return normalized
 
 
 class EventOut(BaseModel):
@@ -41,6 +58,7 @@ class EventOut(BaseModel):
     status: Literal["pending", "acked"]
     created_at: str
     acked_at: str | None = None
+    depends_on: list[str] = Field(default_factory=list)
 
 
 class EventPage(BaseModel):
@@ -119,7 +137,8 @@ def _ingestion_openapi(model: type[BaseModel]) -> dict:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 启动时自动建表（CREATE TABLE IF NOT EXISTS，旧库增量补建 used_nonces）
+    # 启动时自动建表（CREATE TABLE IF NOT EXISTS，旧库增量补建
+    # used_nonces / event_dependencies，旧数据保留）
     db = Database(os.environ.get("DATABASE_PATH", "events.db"))
     # WEBHOOK_SECRETS_JSON 配置非法时快速失败，避免以“全部 401”的状态静默运行
     app.state.authenticator = WebhookAuthenticator.from_env()
@@ -128,7 +147,7 @@ async def lifespan(app: FastAPI):
     db.close()
 
 
-app = FastAPI(title="Webhook Inbox", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="Webhook Inbox", version="1.2.0", lifespan=lifespan)
 
 
 def get_store(request: Request) -> EventStore:
@@ -182,6 +201,11 @@ def _parse_json_body(body: bytes, model: type[BaseModel]) -> BaseModel:
         raise RequestValidationError(exc.errors()) from None
 
 
+def _dependency_detail(error: dict) -> dict:
+    """存储层依赖错误（pos 下标）转对外结构；单条入箱时去掉 index。"""
+    return {key: value for key, value in error.items() if key != "index"}
+
+
 @app.get("/healthz")
 def healthz() -> dict:
     return {"status": "ok"}
@@ -199,17 +223,31 @@ def create_event(
     auth: AuthenticatedRequest = Depends(require_signature),
     store: EventStore = Depends(get_store),
 ):
-    """提交事件。重复提交（内容相同）返回 200 与首个版本；内容不同返回 409。"""
+    """提交事件。重复提交（内容相同，含依赖集合）返回 200 与首个版本；
+    内容不同返回 409；自依赖或引用不存在的事件返回 422。"""
     event = _parse_json_body(auth.body, EventIn)
     assert isinstance(event, EventIn)
     try:
         record, created = store.create_event(
-            event.event_id, event.type, event.payload, source=auth.source, nonce=auth.nonce
+            event.event_id,
+            event.type,
+            event.payload,
+            source=auth.source,
+            nonce=auth.nonce,
+            depends_on=event.depends_on,
         )
     except EventConflictError as exc:
         raise HTTPException(
             status_code=409,
             detail=f"event_id '{exc.event_id}' already exists with different content",
+        )
+    except DependencyError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "dependency validation failed",
+                "errors": [_dependency_detail(e) for e in exc.errors],
+            },
         )
     except ReplayError:
         raise HTTPException(status_code=401, detail="unauthorized") from None
@@ -230,33 +268,44 @@ def create_events_batch(
 ):
     """批量提交事件（1~100 个），整批原子写入。
 
-    批内同 event_id 且内容语义相同视为重复，映射到同一结果；同 ID 内容不同
-    返回 422 并标出冲突下标。与库中记录内容冲突返回 409 及对应下标，且整批
-    零写入。无冲突时单事务写入全部新事件，按原输入顺序返回记录与 created
-    标记；全部已存在时返回 200，否则 201。
+    批内同 event_id 且内容语义相同（type/payload/依赖集合均按集合语义
+    归一）视为重复，映射到同一结果；同 ID 内容不同返回 422 并标出冲突
+    下标。与库中记录内容冲突返回 409 及对应下标，且整批零写入。依赖
+    可引用同批任意位置（前向引用合法）；自依赖、引用缺失（不在库中且
+    不在同批）、批内依赖环均返回 422，给出错条目的原始下标与环路径，
+    同样整批零写入。无冲突时单事务写入全部新事件，按原输入顺序返回
+    记录与 created 标记；全部已存在时返回 200，否则 201。
     """
     batch = _parse_json_body(auth.body, EventBatchIn)
     assert isinstance(batch, EventBatchIn)
 
-    # 批内按 event_id 归并：分组 + 语义级内容比对（与单条接口同一套指纹）
+    # 批内按 event_id 归并：分组 + 语义级内容比对（与单条接口同一套指纹，
+    # 依赖集合排序去重后参与指纹，因此声明顺序与重复项不影响比对结果）
     groups: dict[str, list[int]] = {}
     for idx, event in enumerate(batch.events):
         groups.setdefault(event.event_id, []).append(idx)
 
     intra_conflicts = []
-    unique_items: list[tuple[str, str, Any]] = []
+    unique_items: list[tuple[str, str, Any, list[str]]] = []
     unique_pos: dict[str, int] = {}
     for event_id, indices in groups.items():
         first = batch.events[indices[0]]
-        digest = content_hash(first.type, first.payload)
+        digest = content_hash(first.type, first.payload, first.depends_on)
         if any(
-            content_hash(batch.events[i].type, batch.events[i].payload) != digest
+            content_hash(
+                batch.events[i].type,
+                batch.events[i].payload,
+                batch.events[i].depends_on,
+            )
+            != digest
             for i in indices[1:]
         ):
             intra_conflicts.append({"event_id": event_id, "indices": indices})
         else:
             unique_pos[event_id] = len(unique_items)
-            unique_items.append((event_id, first.type, first.payload))
+            unique_items.append(
+                (event_id, first.type, first.payload, normalize_dependencies(first.depends_on))
+            )
     if intra_conflicts:
         raise HTTPException(
             status_code=422,
@@ -278,6 +327,26 @@ def create_events_batch(
                 "conflicts": [
                     {"event_id": event_id, "indices": groups[event_id]}
                     for event_id in exc.event_ids
+                ],
+            },
+        )
+    except DependencyError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "dependency validation failed",
+                "errors": [
+                    {
+                        # 存储层下标针对去重后的批次；展开回原始输入下标
+                        **{
+                            key: value
+                            for key, value in error.items()
+                            if key not in ("index", "event_id")
+                        },
+                        "event_id": unique_items[error["index"]][0],
+                        "indices": groups[unique_items[error["index"]][0]],
+                    }
+                    for error in exc.errors
                 ],
             },
         )
@@ -309,6 +378,23 @@ def list_events(
         raise HTTPException(status_code=400, detail="invalid cursor")
 
 
+@app.get("/events/ready", response_model=EventPage)
+def list_ready_events(
+    limit: int = Query(default=50, ge=1, le=200),
+    cursor: str | None = Query(default=None),
+    store: EventStore = Depends(get_store),
+):
+    """按与 /events 相同的游标规则，列出全部依赖均已 ack 的 pending 事件。
+
+    无依赖的 pending 事件始终就绪；任一前置依赖仍 pending 则不列出。
+    前置事件确认提交后后继立即解锁（就绪集合随 ack 单调扩大）。
+    """
+    try:
+        return store.list_ready(limit=limit, cursor=cursor)
+    except InvalidCursorError:
+        raise HTTPException(status_code=400, detail="invalid cursor")
+
+
 @app.get("/events/{event_id}", response_model=EventOut)
 def get_event(event_id: str, store: EventStore = Depends(get_store)):
     try:
@@ -319,8 +405,17 @@ def get_event(event_id: str, store: EventStore = Depends(get_store)):
 
 @app.post("/events/{event_id}/ack", response_model=EventOut)
 def ack_event(event_id: str, store: EventStore = Depends(get_store)):
-    """确认单条事件（幂等）。"""
+    """确认单条事件（幂等）。尚有未完成依赖时返回 409 与 blockers。"""
     try:
         return store.ack_event(event_id)
     except EventNotFoundError:
         raise HTTPException(status_code=404, detail="event not found")
+    except EventBlockedError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "event has pending dependencies",
+                "event_id": exc.event_id,
+                "blockers": exc.blockers,
+            },
+        )
