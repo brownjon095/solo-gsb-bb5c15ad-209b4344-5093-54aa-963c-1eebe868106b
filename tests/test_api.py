@@ -18,6 +18,8 @@ from app.db import Database
 from app.main import app
 from app.store import (
     BatchConflictError,
+    DependencyError,
+    EventBlockedError,
     EventConflictError,
     EventNotFoundError,
     EventStore,
@@ -715,7 +717,7 @@ def test_concurrent_replay_single_winner_single_api(tmp_path):
 
 def test_concurrent_replay_single_winner_batch(tmp_path):
     path = str(tmp_path / "batch-replay.db")
-    batch = [("evt-rb1", "t", {"k": 1}), ("evt-rb2", "t", {"k": 2})]
+    batch = [("evt-rb1", "t", {"k": 1}, ()), ("evt-rb2", "t", {"k": 2}, ())]
 
     def submit(_):
         s = EventStore(Database(path))
@@ -796,7 +798,7 @@ def test_store_batch_conflict_rolls_back_everything(store):
     store.create_event("evt-1", "t", {"v": 1}, source=SOURCE, nonce="b0")
     with pytest.raises(BatchConflictError) as exc_info:
         store.create_events_batch(
-            [("evt-2", "t", {"v": 2}), ("evt-1", "t", {"v": 9})],
+            [("evt-2", "t", {"v": 2}, ()), ("evt-1", "t", {"v": 9}, ())],
             source=SOURCE,
             nonce="b1",
         )
@@ -807,7 +809,7 @@ def test_store_batch_conflict_rolls_back_everything(store):
 
 
 def test_concurrent_identical_batches_single_created(store):
-    batch = [("evt-b1", "t", {"k": 1}), ("evt-b2", "t", {"k": 2})]
+    batch = [("evt-b1", "t", {"k": 1}, ()), ("evt-b2", "t", {"k": 2}, ())]
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         outcomes = list(
@@ -830,7 +832,7 @@ def test_concurrent_conflicting_batches_no_partial_commit(store):
         tag = "a" if i % 2 == 0 else "b"
         try:
             res = store.create_events_batch(
-                [("evt-shared", "t", {"v": tag}), (f"evt-uniq-{i}", "t", {"v": i})],
+                [("evt-shared", "t", {"v": tag}, ()), (f"evt-uniq-{i}", "t", {"v": i}, ())],
                 source=SOURCE,
                 nonce=f"cb-{i}",
             )
@@ -852,3 +854,382 @@ def test_concurrent_conflicting_batches_no_partial_commit(store):
             assert res is None
             with pytest.raises(EventNotFoundError):
                 store.get_event(f"evt-uniq-{i}")  # 冲突批次零写入，无部分提交
+
+
+# ---------- 依赖门禁：入箱校验 ----------
+
+
+def dep_event(event_id: str, deps: list[str], i: int = 0) -> dict:
+    return {"event_id": event_id, "type": "t", "payload": {"n": i}, "depends_on": deps}
+
+
+def test_create_event_with_dependencies(client):
+    post_event(client, make_event(1))
+    r = post_event(client, dep_event("e2", ["evt-0001"]))
+    assert r.status_code == 201
+    assert r.json()["depends_on"] == ["evt-0001"]
+    # 无依赖事件响应带空列表
+    assert client.get("/events/evt-0001").json()["depends_on"] == []
+
+
+def test_depends_on_is_a_set_order_and_duplicates_irrelevant(client):
+    post_event(client, make_event(1))
+    post_event(client, make_event(2))
+    r = post_event(client, dep_event("e3", ["evt-0002", "evt-0001", "evt-0002"]))
+    assert r.status_code == 201
+    assert r.json()["depends_on"] == ["evt-0001", "evt-0002"]  # 去重 + 排序
+    # 不同顺序 / 含重复视为同一内容 → 幂等 200，返回首个版本
+    r2 = post_event(client, dep_event("e3", ["evt-0001", "evt-0002"]))
+    assert r2.status_code == 200
+    assert r2.json() == r.json()
+
+
+def test_depends_on_part_of_content_comparison(client):
+    post_event(client, make_event(1))
+    post_event(client, make_event(2))
+    post_event(client, dep_event("e4", ["evt-0001"]))
+    # 同 event_id、同 type/payload，仅依赖集合不同 → 409
+    assert post_event(client, dep_event("e4", ["evt-0002"])).status_code == 409
+    assert post_event(client, dep_event("e4", [])).status_code == 409
+    assert client.get("/events/e4").json()["depends_on"] == ["evt-0001"]  # 首版不变
+
+
+def test_depends_on_at_most_20_unique(client):
+    for i in range(21):
+        post_event(client, make_event(i))
+    ok = dep_event("e5", [f"evt-{i:04d}" for i in range(20)])
+    assert post_event(client, ok).status_code == 201
+    too_many = dep_event("e6", [f"evt-{i:04d}" for i in range(21)])
+    assert post_event(client, too_many).status_code == 422
+    # 21 个元素但只有 20 个唯一值 → 接受（集合语义）
+    with_dup = dep_event("e7", [f"evt-{i:04d}" for i in range(20)] + ["evt-0000"])
+    assert post_event(client, with_dup).status_code == 201
+
+
+def test_missing_dependency_422_and_zero_write(client):
+    r = post_event(client, dep_event("e8", ["ghost"]))
+    assert r.status_code == 422
+    assert r.json()["detail"]["missing"] == [
+        {"event_id": "e8", "indices": [0], "missing": ["ghost"]}
+    ]
+    assert client.get("/events/e8").status_code == 404  # 零写入
+
+
+def test_self_dependency_422_and_zero_write(client):
+    r = post_event(client, dep_event("e9", ["e9"]))
+    assert r.status_code == 422
+    assert r.json()["detail"]["self_dependents"] == [{"event_id": "e9", "indices": [0]}]
+    assert client.get("/events/e9").status_code == 404
+
+
+def test_dependency_error_rolls_back_and_nonce_reusable(client):
+    # 依赖校验失败 → 事务回滚，nonce 不登记，修正后可用同一 nonce 重试
+    body = json.dumps(dep_event("e10", ["ghost"])).encode()
+    assert client.post("/events", content=body, headers=sign(body, nonce="dep-retry")).status_code == 422
+    body2 = json.dumps(dep_event("e10", [])).encode()
+    assert client.post("/events", content=body2, headers=sign(body2, nonce="dep-retry")).status_code == 201
+
+
+def test_batch_dependencies_may_reference_any_position_in_batch(client):
+    events = [
+        dep_event("b2", ["b1"]),  # 引用同批后面的事件
+        {"event_id": "b1", "type": "t", "payload": {}},
+        dep_event("b3", ["b2", "b1"]),
+    ]
+    r = post_batch(client, events)
+    assert r.status_code == 201
+    items = r.json()["items"]
+    assert items[0]["depends_on"] == ["b1"]
+    assert items[1]["depends_on"] == []
+    assert items[2]["depends_on"] == ["b1", "b2"]
+    for e in ("b1", "b2", "b3"):
+        assert client.get(f"/events/{e}").status_code == 200
+
+
+def test_batch_missing_dependency_422_with_indices_and_zero_write(client):
+    events = [
+        {"event_id": "ok", "type": "t", "payload": {}},
+        dep_event("bad", ["ghost"]),
+    ]
+    r = post_batch(client, events)
+    assert r.status_code == 422
+    assert r.json()["detail"]["missing"] == [
+        {"event_id": "bad", "indices": [1], "missing": ["ghost"]}
+    ]
+    assert client.get("/events/ok").status_code == 404  # 整批零写入
+
+
+def test_batch_self_dependency_422(client):
+    r = post_batch(client, [dep_event("s", ["s"])])
+    assert r.status_code == 422
+    assert r.json()["detail"]["self_dependents"] == [{"event_id": "s", "indices": [0]}]
+    assert client.get("/events/s").status_code == 404
+
+
+def test_batch_cycle_422_with_cycle_path_and_zero_write(client):
+    events = [
+        dep_event("ca", ["cb"]),
+        dep_event("cb", ["cc"]),
+        dep_event("cc", ["ca"]),
+    ]
+    r = post_batch(client, events)
+    assert r.status_code == 422
+    cycle = r.json()["detail"]["cycle"]
+    path = cycle["path"]
+    assert path[0] == path[-1]  # 首尾相接的环路径
+    assert set(path[:-1]) == {"ca", "cb", "cc"}
+    assert cycle["indices"] == [0, 1, 2]
+    assert client.get("/events").json()["items"] == []  # 整批零写入
+
+
+def test_batch_two_node_cycle(client):
+    events = [dep_event("x", ["y"]), dep_event("y", ["x"])]
+    r = post_batch(client, events)
+    assert r.status_code == 422
+    path = r.json()["detail"]["cycle"]["path"]
+    assert path[0] == path[-1]
+    assert set(path[:-1]) == {"x", "y"}
+
+
+def test_batch_cycle_through_existing_events_is_fine(client):
+    # 依赖库中已有事件不可能成环（库中事件写入时其依赖已存在）
+    post_event(client, make_event(1))
+    r = post_batch(
+        client,
+        [dep_event("n1", ["evt-0001"]), dep_event("n2", ["n1"]), dep_event("n3", ["n2"])],
+    )
+    assert r.status_code == 201
+
+
+def test_batch_reports_all_dependency_error_kinds(client):
+    events = [
+        dep_event("m", ["ghost"]),          # 引用缺失
+        dep_event("s", ["s"]),              # 自依赖
+        dep_event("y1", ["y2"]),            # 环
+        dep_event("y2", ["y1"]),
+    ]
+    r = post_batch(client, events)
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["missing"] == [{"event_id": "m", "indices": [0], "missing": ["ghost"]}]
+    assert detail["self_dependents"] == [{"event_id": "s", "indices": [1]}]
+    path = detail["cycle"]["path"]
+    assert path[0] == path[-1]
+    assert set(path[:-1]) == {"y1", "y2"}
+    assert detail["cycle"]["indices"] == [2, 3]
+    assert client.get("/events").json()["items"] == []  # 整批零写入
+
+
+def test_batch_intra_depends_on_mismatch_is_content_conflict(client):
+    post_event(client, make_event(1))
+    events = [
+        dep_event("dup", ["evt-0001"]),
+        {"event_id": "dup", "type": "t", "payload": {"n": 0}},  # 同 ID 但依赖不同
+    ]
+    r = post_batch(client, events)
+    assert r.status_code == 422
+    assert r.json()["detail"]["conflicts"] == [{"event_id": "dup", "indices": [0, 1]}]
+
+
+def test_batch_with_dependencies_idempotent_replay(client):
+    events = [{"event_id": "d1", "type": "t", "payload": {}}, dep_event("d2", ["d1"])]
+    assert post_batch(client, events).status_code == 201
+    again = post_batch(client, [dep_event("d2", ["d1"]), {"event_id": "d1", "type": "t", "payload": {}}])
+    assert again.status_code == 200
+    assert all(not it["created"] for it in again.json()["items"])
+    # 同 ID 不同依赖集合 → 与库中内容冲突 409
+    conflict = post_batch(client, [dep_event("d2", [])])
+    assert conflict.status_code == 409
+
+
+def test_store_batch_cycle_raises_and_zero_write(store):
+    with pytest.raises(DependencyError) as exc_info:
+        store.create_events_batch(
+            [("ca", "t", {}, ["cb"]), ("cb", "t", {}, ["ca"])],
+            source=SOURCE,
+            nonce="cyc-1",
+        )
+    path = exc_info.value.cycle
+    assert path[0] == path[-1]
+    assert set(path[:-1]) == {"ca", "cb"}
+    with pytest.raises(EventNotFoundError):
+        store.get_event("ca")  # 整批零写入
+
+
+# ---------- 依赖门禁：ready 列表与确认解锁 ----------
+
+
+def test_ready_events_gate_and_ack_unblocks(client):
+    post_event(client, make_event(1))  # 无依赖 → 立即就绪
+    post_event(client, dep_event("blocked", ["evt-0001"]))
+
+    ready = client.get("/events/ready").json()
+    assert [i["event_id"] for i in ready["items"]] == ["evt-0001"]
+
+    # 直接确认被阻塞的事件 → 409 + blockers，状态不变
+    r = client.post("/events/blocked/ack")
+    assert r.status_code == 409
+    assert r.json()["detail"]["blockers"] == ["evt-0001"]
+    assert client.get("/events/blocked").json()["status"] == "pending"
+
+    # 前置确认后立即解锁：ready 列表与 ack 都放行
+    client.post("/events/evt-0001/ack")
+    ready = client.get("/events/ready").json()
+    assert [i["event_id"] for i in ready["items"]] == ["blocked"]
+    r = client.post("/events/blocked/ack")
+    assert r.status_code == 200
+    assert r.json()["status"] == "acked"
+    assert client.get("/events/ready").json()["items"] == []  # 全部 ack 后无就绪事件
+
+
+def test_ready_events_pagination_follows_cursor_rules(client):
+    for i in range(5):
+        post_event(client, make_event(i))
+    post_event(client, dep_event("blk", ["evt-0000"]))  # 被阻塞，不应出现
+
+    seen, cursor, pages = [], None, 0
+    while True:
+        params = {"limit": 2}
+        if cursor:
+            params["cursor"] = cursor
+        r = client.get("/events/ready", params=params)
+        assert r.status_code == 200
+        body = r.json()
+        seen.extend(item["event_id"] for item in body["items"])
+        cursor = body["next_cursor"]
+        pages += 1
+        if not body["has_more"]:
+            break
+    assert pages == 3
+    assert sorted(seen) == [f"evt-{i:04d}" for i in range(5)]  # blk 不出现
+    assert cursor is None
+    # 非法游标同样 400
+    assert client.get("/events/ready", params={"cursor": "!!!bad!!!"}).status_code == 400
+
+
+def test_ready_chain_unlocks_step_by_step(client):
+    post_batch(
+        client,
+        [
+            {"event_id": "c1", "type": "t", "payload": {}},
+            dep_event("c2", ["c1"]),
+            dep_event("c3", ["c2"]),
+        ],
+    )
+    assert [i["event_id"] for i in client.get("/events/ready").json()["items"]] == ["c1"]
+    client.post("/events/c1/ack")
+    assert [i["event_id"] for i in client.get("/events/ready").json()["items"]] == ["c2"]
+    client.post("/events/c2/ack")
+    assert [i["event_id"] for i in client.get("/events/ready").json()["items"]] == ["c3"]
+    client.post("/events/c3/ack")
+    assert client.get("/events/ready").json()["items"] == []
+
+
+def test_ack_reports_all_unacked_blockers(client):
+    post_batch(
+        client,
+        [
+            {"event_id": "p1", "type": "t", "payload": {}},
+            {"event_id": "p2", "type": "t", "payload": {}},
+            dep_event("child", ["p1", "p2"]),
+        ],
+    )
+    r = client.post("/events/child/ack")
+    assert r.status_code == 409
+    assert r.json()["detail"]["blockers"] == ["p1", "p2"]
+    client.post("/events/p1/ack")
+    r = client.post("/events/child/ack")
+    assert r.status_code == 409
+    assert r.json()["detail"]["blockers"] == ["p2"]  # 只剩未 ack 的
+    client.post("/events/p2/ack")
+    assert client.post("/events/child/ack").status_code == 200
+
+
+def test_concurrent_ack_blocked_until_dependency_acked(store):
+    store.create_event("dep", "t", {}, source=SOURCE, nonce="n-dep")
+    store.create_event("main", "t", {}, ["dep"], source=SOURCE, nonce="n-main")
+
+    def try_ack(_):
+        try:
+            return ("ok", store.ack_event("main"))
+        except EventBlockedError as exc:
+            return ("blocked", exc.blockers)
+
+    # 依赖未 ack：并发确认全部被拒，事件保持 pending
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(try_ack, range(16)))
+    assert all(status == "blocked" for status, _ in results)
+    assert all(blockers == ["dep"] for _, blockers in results)
+    assert store.get_event("main")["status"] == "pending"
+
+    # 前置确认后立即解锁：并发确认全部成功且幂等（只有一个真正写入 acked_at）
+    store.ack_event("dep")
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(try_ack, range(16)))
+    assert all(status == "ok" for status, _ in results)
+    assert all(rec["status"] == "acked" for _, rec in results)
+    assert len({rec["acked_at"] for _, rec in results}) == 1
+
+
+def test_concurrent_ack_multi_connection_unlock(tmp_path):
+    """多连接并发确认：依赖确认后，被阻塞的事件并发 ack 全部成功。"""
+    path = str(tmp_path / "ack-unlock.db")
+    setup = EventStore(Database(path))
+    setup.create_event("root", "t", {}, source=SOURCE, nonce="mc-root")
+    for i in range(8):
+        setup.create_event(f"leaf-{i}", "t", {}, ["root"], source=SOURCE, nonce=f"mc-leaf-{i}")
+    setup.ack_event("root")  # 前置确认，解锁全部 leaf
+    setup.db.close()
+
+    def ack_leaf(i):
+        s = EventStore(Database(path))  # 每线程独立连接
+        try:
+            return s.ack_event(f"leaf-{i}")["status"]
+        finally:
+            s.db.close()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(ack_leaf, range(8)))
+    assert all(status == "acked" for status in results)
+
+    checker = EventStore(Database(path))
+    assert checker.list_ready_events(limit=10)["items"] == []
+    checker.db.close()
+
+
+def test_legacy_database_upgrades_with_dependency_table(tmp_path):
+    """旧库（无 event_dependencies 表）升级：增量补表，旧数据保留且视为无依赖。"""
+    path = str(tmp_path / "legacy-deps.db")
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE events (
+            event_id     TEXT PRIMARY KEY,
+            type         TEXT NOT NULL,
+            payload      TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            status       TEXT NOT NULL DEFAULT 'pending',
+            created_at   TEXT NOT NULL,
+            acked_at     TEXT
+        );
+        CREATE INDEX idx_events_created_at ON events (created_at, event_id);
+        CREATE INDEX idx_events_status ON events (status);
+        INSERT INTO events VALUES ('evt-old', 't', '{"k":0}', 'deadbeef',
+                                   'pending', '2026-09-01T00:00:00.000000Z', NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(path)  # 启动迁移：IF NOT EXISTS 补建 event_dependencies
+    store = EventStore(db)
+    old = store.get_event("evt-old")
+    assert old["payload"] == {"k": 0}  # 旧数据无损
+    assert old["depends_on"] == []  # 旧事件无依赖
+    # 旧事件无依赖 → 立即可就绪、可确认
+    assert [i["event_id"] for i in store.list_ready_events(limit=10)["items"]] == ["evt-old"]
+    store.ack_event("evt-old")
+    # 新事件可依赖旧事件（已 ack → 同样立即可就绪）
+    store.create_event("evt-new", "t", {}, ["evt-old"], source=SOURCE, nonce="legacy-dep")
+    assert [i["event_id"] for i in store.list_ready_events(limit=10)["items"]] == ["evt-new"]
+    db.close()

@@ -29,6 +29,16 @@ CREATE TABLE IF NOT EXISTS used_nonces (
     PRIMARY KEY (source, nonce)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_used_nonces_seen_at ON used_nonces (seen_at);
+
+-- 事件依赖门禁：event_id 的每个前置事件 depends_on（集合语义，主键天然去重）。
+-- 依赖在入箱写事务内校验（必须已在库中或同批、拒绝自依赖与批内环），并计入
+-- content_hash 参与幂等比对。旧库启动时增量补建本表，已有事件无依赖行，
+-- 天然视为“无依赖”（立即可确认、出现在 /events/ready 中）。
+CREATE TABLE IF NOT EXISTS event_dependencies (
+    event_id   TEXT NOT NULL,
+    depends_on TEXT NOT NULL,
+    PRIMARY KEY (event_id, depends_on)
+) WITHOUT ROWID;
 """
 
 # 多连接并发打开时，设置 journal_mode=WAL 需要排他锁，可能立即返回

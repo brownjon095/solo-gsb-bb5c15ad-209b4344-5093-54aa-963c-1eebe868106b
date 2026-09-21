@@ -1,6 +1,6 @@
 # Webhook Inbox
 
-基于 FastAPI + SQLite 的 webhook 收件箱服务。接收事件、**来源签名校验与重放防护**、幂等去重、按时间游标分页查询、单条确认，数据持久化到 SQLite。
+基于 FastAPI + SQLite 的 webhook 收件箱服务。接收事件、**来源签名校验与重放防护**、幂等去重、**事件依赖门禁**、按时间游标分页查询、单条确认，数据持久化到 SQLite。
 
 ## 功能
 
@@ -10,18 +10,23 @@
   - 时间戳偏离服务器时间超过 **300 秒**、来源未知、签名错误、nonce 为空/超长，一律 **401 且零写入**
   - **同来源 nonce 只能使用一次**：重放返回 401。nonce 登记与事件入库在**同一个 SQLite 写事务**内，并发重放只有一次成功
   - 支持密钥轮换：`current` 为现用密钥，`previous` + `previous_valid_until` 定义旧密钥的宽限期，过期后旧签名立即失效
-- **POST /events** 提交事件（`event_id` / `type` / `payload`）
+- **POST /events** 提交事件（`event_id` / `type` / `payload` / 可选 `depends_on`）
   - 并发重复请求只保留**首个版本**，所有重复请求返回与首次一致的结果
-  - 相同 `event_id` 但内容（`type` 或 `payload`）不同 → **409 Conflict**
-  - 内容比对是语义级的：JSON 键序不同但内容相同视为同一事件
+  - 相同 `event_id` 但内容（`type`、`payload` 或 `depends_on`）不同 → **409 Conflict**
+  - 内容比对是语义级的：JSON 键序不同但内容相同视为同一事件；`depends_on` 是集合语义，不计顺序与重复
 - **POST /events/batch** 原子批量提交（1~100 个事件，结构同单条接口）
   - 批内同 `event_id` 内容语义相同 → 视为重复，映射到同一结果；内容不同 → **422** 并标出冲突下标
   - 与库中记录内容冲突 → **409** 并标出对应下标，**整批零写入**
   - 无冲突时**单一事务**写入全部新事件，按原输入顺序返回记录与每项 `created` 标记
+- **事件依赖门禁**（可选 `depends_on`，至多 20 个唯一 `event_id`）
+  - 引用必须**已在库中或同批**（批量可引用同批任意位置），拒绝**自依赖**与**批内环**；任一违规 **422** 并标出对应下标与环路径，**整批零写入**
+  - 依赖集合计入幂等内容比对：同 `event_id` 不同依赖集合 → **409**
+  - **GET /events/ready**：只列出全部依赖均已 ack 的 `pending` 事件（与 `/events` 相同的时间游标规则）
+  - 直接确认尚有未完成依赖的事件 → **409** 并返回 `blockers`；前置事件确认后**立即解锁**
 - **GET /events** 按时间游标分页查询（键集分页，支持 `status` 过滤）
 - **POST /events/{event_id}/ack** 单条确认（幂等，重复确认返回当前状态）
 - **GET /events/{event_id}** 查询单条事件
-- 事件与处理状态（`pending` / `acked`）持久化到 SQLite，**启动时自动建表**；含 `used_nonces` 防重放表，升级已有数据库时只增量补表、不动旧数据
+- 事件与处理状态（`pending` / `acked`）持久化到 SQLite，**启动时自动建表**；含 `used_nonces` 防重放表与 `event_dependencies` 依赖表，升级已有数据库时只增量补表、不动旧数据（旧事件视为无依赖）
 
 ## 快速开始（Docker，一键启动）
 
@@ -160,19 +165,22 @@ curl -i -X POST http://localhost:8000/events \
 | 情况 | 状态码 |
 | --- | --- |
 | 缺少任一头 / 来源未知 / 签名不匹配 / 时间戳超窗 / nonce 超长 / **同来源 nonce 已使用（重放）** | 401，零写入 |
-| 签名合法但请求体不是合法 JSON 或不满足字段约束 | 422 |
-| 单条 `event_id` 内容冲突 | 409 |
+| 签名合法但请求体不是合法 JSON 或不满足字段约束（含 `depends_on` 超过 20 个唯一值） | 422 |
+| 单条 `event_id` 内容冲突（`type` / `payload` / `depends_on` 任一不同） | 409 |
 | 批内内容冲突 422；与库中内容冲突 409（均整批零写入，nonce 不登记，可用新 nonce 重试） | 422 / 409 |
+| 依赖门禁违规（引用缺失 / 自依赖 / 批内环） | 422，整批零写入，nonce 不登记 |
+| 确认尚有未 ack 依赖的事件 | 409，返回 `blockers`，状态不变 |
 
 ## API 一览
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/events` | 提交事件（**需签名头**）。首次 `201`，重复（内容相同）`200`，内容冲突 `409`，鉴权失败 `401` |
-| POST | `/events/batch` | 原子批量提交（1~100 个，**需签名头**）。有新事件 `201`，全部重复 `200`；批内冲突 `422`、与库冲突 `409`、重放/鉴权失败 `401`，均整批零写入 |
+| POST | `/events` | 提交事件（**需签名头**）。首次 `201`，重复（内容相同）`200`，内容冲突 `409`，依赖违规 `422`，鉴权失败 `401` |
+| POST | `/events/batch` | 原子批量提交（1~100 个，**需签名头**）。有新事件 `201`，全部重复 `200`；批内冲突/依赖违规 `422`、与库冲突 `409`、重放/鉴权失败 `401`，均整批零写入 |
 | GET | `/events?limit=&cursor=&status=` | 时间游标分页查询，`limit` 默认 50、最大 200 |
+| GET | `/events/ready?limit=&cursor=` | 只列出全部依赖均已 ack 的 `pending` 事件，游标规则同上 |
 | GET | `/events/{event_id}` | 查询单条事件，不存在 `404` |
-| POST | `/events/{event_id}/ack` | 确认事件（幂等），不存在 `404` |
+| POST | `/events/{event_id}/ack` | 确认事件（幂等），不存在 `404`，尚有未 ack 依赖 `409` + `blockers` |
 | GET | `/healthz` | 健康检查 |
 
 ### 提交事件
@@ -186,14 +194,22 @@ curl -i -X POST http://localhost:8000/events \
   "payload": {"amount": 100},
   "status": "pending",
   "created_at": "2026-09-20T12:00:00.000000Z",
-  "acked_at": null
+  "acked_at": null,
+  "depends_on": []
 }
 ```
 
-相同 `event_id` 不同内容返回 `409`：
+相同 `event_id` 不同内容（`type`、`payload` 或 `depends_on` 任一不同）返回 `409`：
 
 ```json
 {"detail": "event_id 'evt-001' already exists with different content"}
+```
+
+可选的 `depends_on` 声明前置事件（详见下文「事件依赖门禁」）：
+
+```json
+{"event_id": "evt-002", "type": "order.shipped", "payload": {},
+ "depends_on": ["evt-001"]}
 ```
 
 ### 批量提交事件
@@ -203,9 +219,9 @@ curl -i -X POST http://localhost:8000/events \
 ```json
 {
   "items": [
-    {"event_id": "evt-101", "type": "order.paid", "payload": {"amount": 100}, "status": "pending", "created_at": "2026-09-21T03:00:00.000000Z", "acked_at": null, "created": true},
-    {"event_id": "evt-102", "type": "order.paid", "payload": {"amount": 200}, "status": "pending", "created_at": "2026-09-21T03:00:00.000100Z", "acked_at": null, "created": true},
-    {"event_id": "evt-101", "type": "order.paid", "payload": {"amount": 100}, "status": "pending", "created_at": "2026-09-21T03:00:00.000000Z", "acked_at": null, "created": true}
+    {"event_id": "evt-101", "type": "order.paid", "payload": {"amount": 100}, "status": "pending", "created_at": "2026-09-21T03:00:00.000000Z", "acked_at": null, "depends_on": [], "created": true},
+    {"event_id": "evt-102", "type": "order.paid", "payload": {"amount": 200}, "status": "pending", "created_at": "2026-09-21T03:00:00.000100Z", "acked_at": null, "depends_on": ["evt-101"], "created": true},
+    {"event_id": "evt-101", "type": "order.paid", "payload": {"amount": 100}, "status": "pending", "created_at": "2026-09-21T03:00:00.000000Z", "acked_at": null, "depends_on": [], "created": true}
   ]
 }
 ```
@@ -263,13 +279,58 @@ curl -X POST http://localhost:8000/events/evt-001/ack
 
 返回 `200`，`status` 变为 `acked` 并写入 `acked_at`；重复确认仍返回 `200`（幂等）。
 
+### 事件依赖门禁
+
+每个事件可声明至多 **20 个唯一**前置事件 `depends_on`（集合语义：不计顺序与重复，存储与响应中均为排序后的规范形式）。依赖在入箱写事务内校验：
+
+- 引用的 `event_id` 必须**已在库中或同批**（批量提交可引用同批任意位置的事件，包括排在其后的）；
+- 拒绝**自依赖**与**批内环**；
+- 任一违规返回 `422`，标出对应输入下标（与环路径），**整批零写入**，nonce 不登记（修正后可用同一 nonce 重试）；
+- 依赖集合计入幂等内容比对：同 `event_id` 但依赖集合不同 → `409`。
+
+引用缺失（`missing`）、自依赖（`self_dependents`）与批内环（`cycle`）会在同一次响应中分类报告：
+
+```json
+{
+  "detail": {
+    "message": "invalid event dependencies",
+    "missing": [{"event_id": "evt-b", "indices": [1], "missing": ["evt-ghost"]}],
+    "self_dependents": [{"event_id": "evt-c", "indices": [2]}],
+    "cycle": {"path": ["evt-x", "evt-y", "evt-x"], "indices": [3, 4]}
+  }
+}
+```
+
+**就绪列表**：`GET /events/ready` 只列出全部依赖均已 `acked` 的 `pending` 事件（无依赖的事件天然就绪），分页参数与 `/events` 相同：
+
+```bash
+curl "http://localhost:8000/events/ready?limit=50"
+```
+
+**确认门禁**：直接确认尚有未 ack 依赖的事件返回 `409` 与 `blockers` 列表，事件保持 `pending`；前置事件确认后再次 ack 立即成功（解锁即时生效，无需等待）：
+
+```json
+{"detail": {"message": "event has unacked dependencies", "blockers": ["evt-001"]}}
+```
+
+典型用法——按依赖链逐段消费：
+
+```bash
+# 1. 拉取当前可处理的事件
+curl "http://localhost:8000/events/ready"
+# 2. 处理完成后确认；其下游事件随即出现在下一次 /events/ready 中
+curl -X POST http://localhost:8000/events/evt-001/ack
+```
+
 ## 幂等、防重放与并发设计
 
 - **签名先于解析**：入箱路由先读取原始请求体完成 HMAC 校验，再解析 JSON。这样即使请求体是畸形 JSON，鉴权失败仍返回 401（而非让 422 绕过验签），且鉴权阶段完全不触碰数据库，天然零写入。
 - **nonce 登记与入库同事务**：`used_nonces (source, nonce)` 复合主键 + 事件插入在单个 `BEGIN IMMEDIATE` 事务中完成，连接级锁与 SQLite 的写串行化共同保证并发重放（包括多连接）中**只有首个请求提交成功**，其余请求事务回滚并返回 401。内容冲突（409/409 批量冲突、422 批内冲突）同样回滚，nonce 不被登记，调用方修正后可用同一 nonce 重试。
 - **时间窗 + nonce 双保险**：时间戳窗口把可重放区间限制在 300 秒内；nonce 行至少保留 660 秒（2 倍窗口加余量），惰性清理，保证任何可能被接受的旧时间戳都无法重放。
-- 事件写入路径在同事务内「查重 + 插入 + 回读」；SQLite（WAL 模式）串行化并发写，因此并发重复 `event_id` 只有一个真正落库，其余请求读到首个版本并原样返回。
-- 内容指纹 = `SHA-256(type + 规范化JSON(payload))`（键排序、去空白），指纹不同即 `409`，已存数据不会被覆盖。批量接口在批内归并与库级比对中复用同一套指纹规则。
+- 事件写入路径在同事务内「查重 + 依赖校验 + 插入 + 回读」；SQLite（WAL 模式）串行化并发写，因此并发重复 `event_id` 只有一个真正落库，其余请求读到首个版本并原样返回。
+- 内容指纹 = `SHA-256(type + 规范化JSON(payload) [+ 排序后的依赖集合])`（键排序、去空白），指纹不同即 `409`，已存数据不会被覆盖。批量接口在批内归并与库级比对中复用同一套指纹规则。空依赖时指纹与引入依赖特性前逐字节一致，旧库中已有事件重投仍判幂等。
+- **依赖门禁同事务校验**：依赖关系存于 `event_dependencies` 表，与事件插入在同一 `BEGIN IMMEDIATE` 事务内完成「引用存在性（库中或同批）+ 自依赖 + 批内环（DFS 三色标记）」校验，任一违规整批回滚。环只可能出现在批内——库中事件写入时其依赖必须已存在，不可能回指批内新事件，因此只需在批内新建事件的子图上找环。
+- **确认门禁与就绪查询**：`ack` 在连接锁内先查未 ack 依赖（有则 `409` 且状态不变），无则更新；`/events/ready` 用 `NOT EXISTS` 子查询过滤出全部依赖均已 ack 的 `pending` 事件，前置确认提交后立即可见。
 - 批量写入在**单一事务**内完成「nonce 登记 + 查库比对 + 全部插入 + 回读」（连接级锁 + `BEGIN IMMEDIATE`），并发批次彼此串行：任一冲突即整批回滚，不产生部分提交，也不会覆盖首个版本。
 - 验签使用 `hmac.compare_digest` 常量时间比较；所有鉴权失败返回相同的 401 响应，不泄露失败环节。
 
@@ -296,7 +357,7 @@ environment:
 ```bash
 pip install -r requirements-dev.txt
 export WEBHOOK_SECRETS_JSON='{"demo":{"current":"dev-only-secret-change-me"}}'
-pytest tests/ -q                 # 55 个测试：签名/重放/密钥轮换、幂等、409、分页、ack、批量原子性、并发、旧库迁移、持久化
+pytest tests/ -q                 # 79 个测试：签名/重放/密钥轮换、幂等、409、分页、ack、批量原子性、依赖门禁（环/缺失/自依赖）、ready 列表、并发确认与解锁、旧库迁移、持久化
 DATABASE_PATH=./events.db uvicorn app.main:app --reload --port 8000
 ```
 
@@ -306,8 +367,8 @@ DATABASE_PATH=./events.db uvicorn app.main:app --reload --port 8000
 app/
   main.py    # FastAPI 路由、签名头依赖与请求模型（验签后手动解析原始体）
   auth.py    # WEBHOOK_SECRETS_JSON 解析、HMAC-SHA256 验签、时间窗与轮换宽限
-  store.py   # nonce 登记 + 幂等写入（同一写事务）、游标分页、确认（存储层）
-  db.py      # SQLite 连接、WAL、自动建表（events / used_nonces）
+  store.py   # nonce 登记 + 依赖门禁 + 幂等写入（同一写事务）、游标分页、确认（存储层）
+  db.py      # SQLite 连接、WAL、自动建表（events / used_nonces / event_dependencies）
 tests/
   test_api.py
 Dockerfile
