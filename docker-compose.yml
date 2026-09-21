@@ -1,0 +1,19 @@
+services:
+  webhook-inbox:
+    build: .
+    image: webhook-inbox:latest
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/events.db
+      # 开箱即用的演示来源密钥，生产环境务必覆盖：
+      # WEBHOOK_SECRETS_JSON='{"<来源名>":{"current":"<强随机密钥>"}}'
+      # 密钥轮换时可追加 "previous" 与 "previous_valid_until"（宽限期截止时间）
+      WEBHOOK_SECRETS_JSON: >-
+        {"demo":{"current":"dev-only-secret-change-me"}}
+    volumes:
+      - webhook-data:/data
+    restart: unless-stopped
+
+volumes:
+  webhook-data:
